@@ -1,15 +1,14 @@
-"""Sharded execution for club-scale processing.
+"""Sharded execution for club-scale processing (fixed baseline).
 
-The club outgrew a single nightly process, so processing is split across worker
-shards: athletes are partitioned into shards, each shard worker processes its
-own athletes independently, and a merge step combines the shard outputs into the
-final club-wide result.
-
-``run_sharded`` is the entry point. ``full_rebuild`` (single process, whole
-club) remains the reference the sharded output must match.
+Athletes are partitioned into shards by a stable hash; each shard computes only
+the per-athlete metrics (which are independent across athletes); the merge step
+computes all club-wide group metrics (cohort z-scores, rankings) over the full
+combined set so they are never computed against a partial group.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 import numpy as np
 import pandas as pd
@@ -24,20 +23,16 @@ from trainload.metrics import (
 
 
 def _assign_shards(athletes, n_shards: int) -> dict:
-    """Map each athlete to a shard. Uses a stable hash so a given athlete is
-    always handled by the same shard across runs."""
-    return {a: (hash(a) % n_shards) for a in athletes}
+    """Stable, deterministic athlete->shard map (md5, not built-in hash)."""
+    out = {}
+    for a in athletes:
+        h = int(hashlib.md5(str(a).encode()).hexdigest(), 16)
+        out[a] = h % n_shards
+    return out
 
 
-def _process_shard(activities_path: str, my_athletes, settings: Settings) -> dict:
-    """Process one shard worker: load the club file, keep this shard's athletes,
-    clean and compute that shard's metrics.
-
-    Each worker reads the shared activities file and filters to its own athletes
-    (workers don't share memory).
-    """
-    raw = load_activities(activities_path, settings)
-    rows = raw[raw["athlete_id"].isin(my_athletes)]
+def _process_shard(rows: pd.DataFrame, settings: Settings) -> dict:
+    """Per-shard work: only per-athlete metrics (independent across athletes)."""
     clean = _clean(rows, settings)
     pmc = compute_pmc(clean, settings)
     return {
@@ -46,48 +41,47 @@ def _process_shard(activities_path: str, my_athletes, settings: Settings) -> dic
         "zones": time_in_zones(clean, settings),
         "pmc": pmc,
         "acwr": compute_acwr(clean, settings),
-        # how each athlete compares to the group that day
-        "cohort_z": group_load_zscores(clean, settings),
-        "ramp": rank_by_ramp(clean, settings),
         "readiness": athlete_readiness(pmc, settings),
     }
 
 
 def _merge_shards(shard_outputs: list, settings: Settings) -> dict:
-    """Combine per-shard outputs into the club-wide result."""
     merged = {}
-    keys = ["activities", "volume", "zones", "pmc", "acwr",
-            "cohort_z", "ramp", "readiness"]
-    for k in keys:
+    for k in ["activities", "volume", "zones", "pmc", "acwr", "readiness"]:
         parts = [o[k] for o in shard_outputs
                  if o.get(k) is not None and not o[k].empty]
         merged[k] = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
 
-    if not merged["ramp"].empty:
-        merged["ramp"] = (merged["ramp"]
-                          .sort_values("ramp", ascending=False)
-                          .reset_index(drop=True))
+    # club-wide group metrics computed over the FULL combined activity set
+    clean_all = merged["activities"]
+    if not clean_all.empty:
+        merged["cohort_z"] = group_load_zscores(clean_all, settings)
+        merged["ramp"] = rank_by_ramp(clean_all, settings)
+    else:
+        merged["cohort_z"] = pd.DataFrame()
+        merged["ramp"] = pd.DataFrame()
     return merged
 
 
 def run_sharded(activities_path: str, n_shards: int = 4,
                 settings: Settings = None) -> dict:
-    """Process the whole club split across ``n_shards`` shards, then merge.
+    """Process the club split across ``n_shards`` shards, then merge.
 
-    The result is expected to match ``full_rebuild`` over the same data.
+    Matches ``full_rebuild`` for any shard count.
     """
     if settings is None:
         settings = load_settings()
 
-    raw = load_activities(activities_path, settings)
+    raw = load_activities(activities_path, settings)            # load once
     athletes = sorted(raw["athlete_id"].unique())
     assignment = _assign_shards(athletes, n_shards)
+    raw["_shard"] = raw["athlete_id"].map(assignment)
 
     shard_outputs = []
     for sh in range(n_shards):
-        mine = [a for a, s in assignment.items() if s == sh]
-        if not mine:
+        rows = raw[raw["_shard"] == sh].drop(columns="_shard")
+        if rows.empty:
             continue
-        shard_outputs.append(_process_shard(activities_path, mine, settings))
+        shard_outputs.append(_process_shard(rows, settings))
 
     return _merge_shards(shard_outputs, settings)

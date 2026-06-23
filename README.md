@@ -269,5 +269,36 @@ What "correct" looks like:
   at club scale. If each worker re-reads or re-derives the whole club's data, the
   total work grows with the number of shards and sharding is pointless. Per-shard
   work must scale with the shard's own data, not the whole club's.
-* **Scale.** All of the above must hold at 50+ athletes across many shards on the
-  pinned pandas 1.1.3.
+## Nightly production runner (newest, not yet trusted)
+
+The whole system is now wired into a single nightly runner: ingest the day's
+exports, run the sharded pipeline, compact old data, over a whole season at club
+scale.
+
+```
+trainload/incremental/production.py
+  run_production_night()   one night: shard the running history + compact + merge
+  run_production_season()  drive a whole season of nightly runs
+```
+
+It is **additive** — the per-layer entry points are unchanged. `full_rebuild`
+over the same submitted data is the reference.
+
+What "correct" looks like:
+
+* **A season equals a full rebuild.** Driving the data night-by-night through
+  `run_production_season` must produce the same final club-wide metrics as
+  `full_rebuild` over everything submitted — same cleaned activities, same PMC,
+  same cohort numbers — for any shard count. Small per-night differences that
+  look like noise but accumulate over a season are bugs.
+* **It must stay fast as the season grows.** A night's run must not get slower as
+  more history piles up; a season must not be quadratic in its length, and the
+  whole thing must finish at club scale (50+ athletes, two seasons) on a normal
+  machine. If it can't, that's the headline bug.
+* **Compaction is consistent.** Old-data compaction must not change the current
+  metrics and must be applied consistently across the whole club, not on
+  per-shard boundaries that differ between shards.
+* **Bounded resources.** Memory and working files must stay bounded across a
+  season; nothing should grow without limit night after night.
+* **Both engines.** All of the above must hold at club scale on the pinned pandas
+  1.1.3 as well as modern pandas.
