@@ -51,16 +51,18 @@ def compact_old_months(store_path: str, cutoff: pd.Timestamp,
         return
 
     # summarise the old rows into one row per (athlete, sport, month)
+    # Summarise old rows into one row per (athlete, sport, CALENDAR-DAY) using the
+    # CLEANED rows, so daily resolution (which PMC needs) is preserved.
     old = old.copy()
-    months = old["start_time"].dt.tz_localize(None).dt.to_period("M").dt.to_timestamp()
-    old["month"] = months.dt.tz_localize("UTC")
+    old_clean = _clean(old, settings)
+    old_clean["day"] = old_clean["start_time"].dt.floor("D")
     summ = (
-        old.groupby(["athlete_id", "sport", "month"], as_index=False)
+        old_clean.groupby(["athlete_id", "sport", "day"], as_index=False)
         .agg(load=("load", "sum"),
              duration_min=("duration_min", "sum"),
              hr_mean=("hr_mean", "mean"))
     )
-    summ = summ.rename(columns={"month": "start_time"})
+    summ = summ.rename(columns={"day": "start_time"})
     summ["source"] = "compacted"
     summ["ftp"] = np.nan
     summ["lthr"] = np.nan
@@ -73,12 +75,22 @@ def compact_old_months(store_path: str, cutoff: pd.Timestamp,
     store.save()
 
 
+def safe_retention_horizon(settings: Settings, requested_days: int) -> int:
+    """Never retain below the longest metric lookback (CTL needs a warm window)."""
+    floor = max(settings.pmc.ctl_days * 3, settings.acwr.chronic_days) + 14
+    return max(requested_days, floor)
+
+
 def apply_retention(store_path: str, horizon_days: int,
                     settings: Settings) -> None:
-    """Drop raw rows older than ``horizon_days`` before the latest activity."""
+    """Drop raw rows older than ``horizon_days`` before the latest activity.
+
+    The horizon is clamped so it never eats into the active metric window.
+    """
     store = MetricStore.load(store_path)
     if store.raw.empty:
         return
+    horizon_days = safe_retention_horizon(settings, horizon_days)
     raw = store.raw.copy()
     raw["start_time"] = pd.to_datetime(raw["start_time"], utc=True)
     cutoff = raw["start_time"].max() - pd.Timedelta(days=horizon_days)

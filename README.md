@@ -234,5 +234,40 @@ What "correct" looks like:
   remove history that a current metric still needs (e.g. the trailing window the
   CTL curve is built from). Current fitness numbers must be unchanged by
   retention.
-* **Scale.** All of the above must hold at 50+ athletes over a couple of seasons,
-  on the pinned pandas 1.1.3.
+## Sharded execution (newest, not yet trusted)
+
+The club outgrew a single nightly process, so processing is now split across
+worker shards: athletes are partitioned into shards, each shard worker processes
+its own athletes, and a merge step combines the shard outputs into the club-wide
+result.
+
+```
+trainload/incremental/shard.py
+  run_sharded(activities, n_shards)   partition -> per-shard process -> merge
+```
+
+It is **additive** — `full_rebuild` (single process, whole club) is unchanged and
+is the reference the sharded output must match.
+
+What "correct" looks like:
+
+* **Sharding must not change the answer.** `run_sharded` must produce the same
+  result as `full_rebuild` over the same data, for *any* number of shards. The
+  number of shards is an execution detail; it must never change a single
+  computed number. In particular, splitting the club across shards must give the
+  same cohort comparisons, the same rankings, the same per-athlete curves as
+  processing everyone together.
+* **Group metrics are club-wide, not per-shard.** Anything that compares an
+  athlete to the *group* (the cohort z-scores, any club ranking or percentile)
+  must be computed against the whole club, not against whichever athletes
+  happened to land in the same shard. A shard only holds a slice of the club; a
+  group statistic computed inside one shard is meaningless.
+* **Deterministic and stable.** The same input must give the same output every
+  run. Shard assignment must be stable across runs (an athlete always lands in
+  the same shard) so a persistent sharded store stays consistent.
+* **Sharding must be faster, not slower.** The point of sharding is to go faster
+  at club scale. If each worker re-reads or re-derives the whole club's data, the
+  total work grows with the number of shards and sharding is pointless. Per-shard
+  work must scale with the shard's own data, not the whole club's.
+* **Scale.** All of the above must hold at 50+ athletes across many shards on the
+  pinned pandas 1.1.3.

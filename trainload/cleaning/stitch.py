@@ -30,9 +30,10 @@ def stitch_sessions(df: pd.DataFrame, settings: Settings,
         grp = grp.sort_values("start_time")
         pending = None
 
-        for _, row in grp.iterrows():
+        # iterate a list of dicts instead of iterrows (much faster)
+        for row in grp.to_dict("records"):
             if pending is None:
-                pending = row.copy()
+                pending = dict(row)
                 continue
 
             same_sport = row["sport"] == pending["sport"]
@@ -44,12 +45,11 @@ def stitch_sessions(df: pd.DataFrame, settings: Settings,
             if same_sport and 0 <= gap_min <= max_gap_min:
                 pending["duration_min"] = pending["duration_min"] + row["duration_min"]
                 pending["load"] = pending["load"] + row["load"]
-                # keep the earlier start; weighted-mean the heart rate
                 if pd.notna(row.get("hr_mean")) and pd.notna(pending.get("hr_mean")):
                     pending["hr_mean"] = (pending["hr_mean"] + row["hr_mean"]) / 2.0
             else:
                 out_rows.append(pending)
-                pending = row.copy()
+                pending = dict(row)
 
         if pending is not None:
             out_rows.append(pending)

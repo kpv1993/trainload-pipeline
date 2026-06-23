@@ -6,3 +6,5 @@ from trainload.incremental.safe import safe_update_store  # noqa: F401
 from trainload.incremental.maintenance import (  # noqa: F401
     compact_old_months, apply_retention, run_season,
 )
+
+from trainload.incremental.shard import run_sharded  # noqa: F401
