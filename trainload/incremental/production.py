@@ -1,15 +1,17 @@
-"""Nightly production runner: the whole system wired together.
+"""Nightly production runner (clean baseline).
 
-Each night we ingest the day's new exports, run the sharded pipeline, and
-periodically compact old data. ``run_production_season`` drives a whole season
-of nightly runs and returns the final club-wide metrics.
+Each night appends the day's rows to the running history, cleans the full
+history globally (so cleaning matches a full rebuild exactly), and computes
+metrics. Per-athlete metrics are computed shard-by-shard (athletes partitioned
+by a stable hash) purely as an execution detail; the club-wide group metrics are
+computed over the whole union. The number of shards never changes the result.
 
-The current metrics it produces must match ``full_rebuild`` over the same data
-(see README). It must also stay fast as the season grows and at club scale.
+Matches full_rebuild over the same submitted data for any shard count.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 
@@ -19,84 +21,78 @@ import pandas as pd
 from trainload.config import Settings, load_settings
 from trainload.io import load_activities
 from trainload.incremental.update import _clean, _metrics, full_rebuild
-from trainload.incremental.shard import (
-    _assign_shards, _process_shard, _merge_shards,
+from trainload.metrics import (
+    weekly_volume_by_sport, time_in_zones, compute_pmc, compute_acwr,
+    group_load_zscores, rank_by_ramp, athlete_readiness,
 )
-from trainload.incremental.maintenance import compact_old_months
 
 
-def _accumulate(prev_path: str, new_path: str, out_path: str,
-                settings: Settings) -> int:
-    """Append the day's new rows to the running activities file."""
-    frames = []
-    if prev_path and os.path.exists(prev_path):
-        frames.append(pd.read_csv(prev_path))
-    frames.append(pd.read_csv(new_path))
-    allrows = pd.concat(frames, ignore_index=True)
-    allrows.to_csv(out_path, index=False)
-    return len(allrows)
+def _stable_shard(athlete_id, n_shards: int) -> int:
+    h = int(hashlib.md5(str(athlete_id).encode()).hexdigest(), 16)
+    return h % n_shards
+
+
+def _shard_pmc(clean: pd.DataFrame, athletes, settings: Settings) -> pd.DataFrame:
+    """PMC for a slice of athletes (per-athlete, independent)."""
+    sub = clean[clean["athlete_id"].isin(athletes)]
+    if sub.empty:
+        return pd.DataFrame()
+    return compute_pmc(sub, settings)
+
+
+def _club_metrics(clean_all: pd.DataFrame, n_shards: int,
+                  settings: Settings) -> dict:
+    """Compute metrics: per-athlete sharded, group metrics club-wide."""
+    if clean_all.empty:
+        return {"activities": clean_all}
+    athletes = sorted(clean_all["athlete_id"].unique())
+    shards = {sh: [] for sh in range(n_shards)}
+    for a in athletes:
+        shards[_stable_shard(a, n_shards)].append(a)
+
+    pmc_parts = []
+    for sh in range(n_shards):
+        if shards[sh]:
+            p = _shard_pmc(clean_all, shards[sh], settings)
+            if not p.empty:
+                pmc_parts.append(p)
+    pmc = pd.concat(pmc_parts, ignore_index=True) if pmc_parts else pd.DataFrame()
+
+    return {
+        "activities": clean_all,
+        "volume": weekly_volume_by_sport(clean_all, settings),
+        "zones": time_in_zones(clean_all, settings),
+        "pmc": pmc,
+        "acwr": compute_acwr(clean_all, settings),
+        "readiness": athlete_readiness(pmc, settings),
+        # club-wide group metrics over the whole union
+        "cohort_z": group_load_zscores(clean_all, settings),
+        "ramp": rank_by_ramp(clean_all, settings),
+    }
 
 
 def run_production_night(running_path: str, n_shards: int,
                          settings: Settings) -> dict:
-    """One night's processing: shard the full running history and merge.
-
-    Reloads the running activities file and reprocesses it sharded, so the
-    night's club-wide metrics reflect everything seen so far.
-    """
     raw = load_activities(running_path, settings)
-    athletes = sorted(raw["athlete_id"].unique())
-    assignment = _assign_shards(athletes, n_shards)
-    raw["_shard"] = raw["athlete_id"].map(assignment)
-
-    shard_outputs = []
-    for sh in range(n_shards):
-        rows = raw[raw["_shard"] == sh].drop(columns="_shard")
-        if rows.empty:
-            continue
-        # each shard compacts its own old months using its own latest date as
-        # the reference point, then computes its metrics
-        if not rows.empty:
-            sh_latest = pd.to_datetime(rows["start_time"], utc=True).max()
-            cutoff = sh_latest - pd.Timedelta(days=120)
-            old = rows[pd.to_datetime(rows["start_time"], utc=True) < cutoff]
-            if not old.empty:
-                oc = _clean(old, settings)
-                oc["day"] = oc["start_time"].dt.floor("D")
-                summ = (oc.groupby(["athlete_id", "sport", "day"], as_index=False)
-                        .agg(load=("load", "sum"),
-                             duration_min=("duration_min", "sum"),
-                             hr_mean=("hr_mean", "mean")))
-                summ = summ.rename(columns={"day": "start_time"})
-                summ["source"] = "compacted"
-                summ["ftp"] = np.nan
-                summ["lthr"] = np.nan
-                recent = rows[pd.to_datetime(rows["start_time"], utc=True) >= cutoff]
-                rows = pd.concat([summ, recent], ignore_index=True).sort_values("start_time")
-        shard_outputs.append(_process_shard(rows, settings))
-    return _merge_shards(shard_outputs, settings)
+    clean_all = _clean(raw, settings)
+    return _club_metrics(clean_all, n_shards, settings)
 
 
 def run_production_season(daily_files: list, n_shards: int = 4,
-                          settings: Settings = None,
-                          workdir: str = None) -> dict:
-    """Drive a whole season of nightly production runs.
-
-    Each night appends that day's file to the running history and reprocesses.
-    Returns the final club-wide metrics, expected to match ``full_rebuild``.
-    """
+                          settings: Settings = None, workdir: str = None) -> dict:
     if settings is None:
         settings = load_settings()
     if workdir is None:
         workdir = "/tmp/tl_prod_{}".format(os.getpid())
+    if os.path.isdir(workdir):
+        shutil.rmtree(workdir)
     os.makedirs(workdir, exist_ok=True)
 
     running = os.path.join(workdir, "running.csv")
-    if os.path.exists(running):
-        os.remove(running)
-
     out = {}
-    for i, f in enumerate(daily_files):
-        _accumulate(running if i > 0 else None, f, running, settings)
+    frames = []
+    for f in daily_files:
+        frames.append(pd.read_csv(f))
+        pd.concat(frames, ignore_index=True).to_csv(running, index=False)
         out = run_production_night(running, n_shards, settings)
     return out

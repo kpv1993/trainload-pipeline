@@ -8,6 +8,6 @@ workload ratio (ACWR) overreach flag.
 The public entry point is :func:`trainload.pipeline.run_pipeline`.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 from trainload.pipeline import run_pipeline  # noqa: E402,F401

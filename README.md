@@ -302,3 +302,34 @@ What "correct" looks like:
   season; nothing should grow without limit night after night.
 * **Both engines.** All of the above must hold at club scale on the pinned pandas
   1.1.3 as well as modern pandas.
+
+## Club dashboard rollups (newest, not yet trusted)
+
+On top of the nightly production metrics there's a club dashboard layer:
+
+```
+trainload/incremental/clubstats.py
+  club_leaderboard()      top-K most-loaded athletes by CTL
+  club_percentiles()      each athlete's club-relative load percentile
+  club_fitness_summary()  mean/median club CTL per week
+  season_load_totals()    running season load total per athlete
+  recent_form()           7-day vs prior-7-day load change per athlete
+```
+
+What "correct" looks like:
+
+* **Shard-count invariant.** Every rollup must give the same answer regardless of
+  how many shards the club is processed with. The leaderboard at 32 shards must be
+  the same athletes as at 1 shard.
+* **Scale invariant.** Percentiles and rankings must be exact at any club size —
+  50, 100, or 200+ athletes. An athlete's club percentile must equal its true rank
+  in the club, with no error that grows as the club grows.
+* **Both engines.** Every rollup must produce the same result on the pinned pandas
+  1.1.3 and on modern pandas. Nothing may rely on a deprecated or
+  version-specific API.
+* **Long-season correctness.** Weekly and seasonal rollups must stay correct over
+  multiple seasons — weeks from different years must never be merged, and running
+  totals must not lose precision over thousands of nightly updates.
+* **Order independence.** Rollups must be correct when activities arrive out of
+  order; a late export of older data must be reflected, not missed because only
+  the most recent files were read.
